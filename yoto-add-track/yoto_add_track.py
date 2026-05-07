@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import requests
 import yt_dlp
@@ -261,6 +262,27 @@ def find_card(manager: YotoManager, token_file: Path, name_or_id: str) -> Card:
 # YouTube download
 # ---------------------------------------------------------------------------
 
+def is_youtube_playlist(url: str) -> bool:
+    """Return True if the URL points to a YouTube playlist (not a video in a playlist)."""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    return "youtube.com" in parsed.netloc and "list" in qs and "v" not in qs
+
+
+def get_playlist_urls(playlist_url: str) -> list[str]:
+    """Return individual video URLs for all available videos in a YouTube playlist."""
+    opts = {"extract_flat": "in_playlist", "quiet": True, "no_warnings": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(playlist_url, download=False)
+
+    entries = [e for e in (info.get("entries") or []) if e and e.get("id")]
+    if not entries:
+        sys.exit("No videos found in playlist.")
+
+    print(f"Playlist: {info.get('title', 'Unknown')} — {len(entries)} videos")
+    return [f"https://www.youtube.com/watch?v={e['id']}" for e in entries]
+
+
 def download_mp3(youtube_url: str, output_dir: Path) -> tuple[Path, str, int]:
     """Download YouTube audio as MP3. Returns (path, title, duration_seconds)."""
     opts = {
@@ -457,9 +479,9 @@ def add_track_to_card(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download a YouTube song and add it to a Yoto MYO card playlist."
+        description="Download a YouTube video or playlist and add it to a Yoto MYO card."
     )
-    parser.add_argument("youtube_url", help="YouTube video URL")
+    parser.add_argument("youtube_url", help="YouTube video or playlist URL")
     parser.add_argument(
         "playlist",
         help="Card title (partial, case-insensitive) or card ID (5-char alphanumeric)",
@@ -503,12 +525,31 @@ def main() -> None:
 
 
 def _run(args, card: Card, manager: YotoManager, token_file: Path, output_dir: Path, keep_mp3: bool) -> None:
-    print(f"Downloading audio from YouTube...")
-    mp3_path, title, duration = download_mp3(args.youtube_url, output_dir)
+    if is_youtube_playlist(args.youtube_url):
+        urls = get_playlist_urls(args.youtube_url)
+        failed = 0
+        for i, url in enumerate(urls, 1):
+            print(f"\n[{i}/{len(urls)}]")
+            try:
+                _process_one(url, args.dry_run, card, manager, token_file, output_dir, keep_mp3)
+            except Exception as exc:
+                print(f"Skipping — {exc}")
+                failed += 1
+        if failed:
+            print(f"\nDone. {len(urls) - failed}/{len(urls)} videos added ({failed} skipped).")
+        else:
+            print(f"\nDone. All {len(urls)} videos added.")
+    else:
+        _process_one(args.youtube_url, args.dry_run, card, manager, token_file, output_dir, keep_mp3)
+
+
+def _process_one(url: str, dry_run: bool, card: Card, manager: YotoManager, token_file: Path, output_dir: Path, keep_mp3: bool) -> None:
+    print("Downloading audio from YouTube...")
+    mp3_path, title, duration = download_mp3(url, output_dir)
     print(f"Downloaded: {title} ({duration}s)")
 
-    if args.dry_run:
-        print(f"\n[dry-run] Would add '{title}' to '{card.title}' ({card.id}).")
+    if dry_run:
+        print(f"[dry-run] Would add '{title}' to '{card.title}' ({card.id}).")
         if keep_mp3:
             print(f"[dry-run] MP3 saved at: {mp3_path}")
         return

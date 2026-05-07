@@ -156,7 +156,7 @@ Uses **OAuth 2.0 Device Authorization Flow** — suitable for CLI/headless use.
 - Required scopes: `family:library:view user:content:manage offline_access`
 - Access tokens are short-lived JWTs; refresh tokens are single-use and automatically rotated
 
-The `yoto-api` Python library (`cdnninja/yoto_api`) is used for token refresh and library listing. The script implements its own device code flow rather than using the library's `device_code_flow_start()` method, because the library hardcodes `scope: "offline_access"` in its auth request — which produces a token that cannot access content or library endpoints. Media upload and content creation are called directly against the REST API since the library does not wrap those endpoints.
+All API calls are made directly with `requests` — no Yoto client library is used. The script implements the full OAuth device code flow, token refresh, library listing, media upload, and content management itself.
 
 ### Data model
 
@@ -292,8 +292,7 @@ Declared inline in `yoto_add_track.py` via [PEP 723](https://peps.python.org/pep
 | Package | Purpose |
 |---------|---------|
 | `yt-dlp` | Download YouTube audio |
-| `yoto-api` | Yoto OAuth device code flow + library listing |
-| `requests` | Direct REST calls for upload and content endpoints |
+| `requests` | All Yoto REST calls (auth, upload, content) |
 | `python-dotenv` | Load `.env` config |
 
 ---

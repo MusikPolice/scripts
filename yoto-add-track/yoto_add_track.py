@@ -3,7 +3,6 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "yt-dlp>=2024.1.0",
-#   "yoto-api>=2.0.0",
 #   "requests>=2.31.0",
 #   "python-dotenv>=1.0.0",
 # ]
@@ -28,20 +27,83 @@ import os
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 import yt_dlp
 from dotenv import load_dotenv
-from yoto_api import YotoManager
-from yoto_api.Token import Token
 
 YOTO_API_BASE = "https://api.yotoplay.com"
 YOTO_AUTH_URL = "https://login.yotoplay.com/oauth/device/code"
 YOTO_TOKEN_URL = "https://login.yotoplay.com/oauth/token"
 YOTO_SCOPES = "family:library:view user:content:manage offline_access"
 
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Token:
+    access_token: str = None
+    refresh_token: str = None
+    token_type: str = "Bearer"
+    scope: str = None
+    valid_until: datetime = None
+
+
+@dataclass
+class Card:
+    id: str
+    title: str
+
+
+class YotoManager:
+    def __init__(self, client_id: str) -> None:
+        if not client_id:
+            raise ValueError("A client_id must be provided")
+        self.client_id = client_id
+        self.token: Token = None
+
+    def set_refresh_token(self, refresh_token: str) -> None:
+        self.token = Token(refresh_token=refresh_token)
+
+    def check_and_refresh_token(self) -> Token:
+        if self.token is None:
+            raise ValueError("No token available, please authenticate first")
+        needs_refresh = (
+            self.token.access_token is None
+            or self.token.valid_until is None
+            or self.token.valid_until - timedelta(hours=1) <= datetime.now(timezone.utc)
+        )
+        if not needs_refresh:
+            return self.token
+
+        resp = requests.post(
+            YOTO_TOKEN_URL,
+            data={
+                "client_id": self.client_id,
+                "grant_type": "refresh_token",
+                "refresh_token": self.token.refresh_token,
+                "audience": YOTO_API_BASE,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        body = resp.json()
+        if body.get("error"):
+            raise ValueError(
+                f"Token refresh failed: {body.get('error_description', body['error'])}"
+            )
+        self.token = Token(
+            access_token=body["access_token"],
+            refresh_token=body["refresh_token"],
+            token_type=body.get("token_type", "Bearer"),
+            scope=self.token.scope,
+            valid_until=datetime.now(timezone.utc) + timedelta(seconds=body["expires_in"]),
+        )
+        return self.token
 
 
 # ---------------------------------------------------------------------------
@@ -164,18 +226,26 @@ def _auth_headers(manager: YotoManager, token_file: Path) -> dict:
 # Card lookup
 # ---------------------------------------------------------------------------
 
-def find_card(manager: YotoManager, name_or_id: str):
+def find_card(manager: YotoManager, token_file: Path, name_or_id: str) -> Card:
     """Find a card by exact ID or case-insensitive title match."""
-    manager.update_library()
+    resp = requests.get(
+        f"{YOTO_API_BASE}/card/family/library",
+        headers=_auth_headers(manager, token_file),
+    )
+    resp.raise_for_status()
+    library = {
+        item["cardId"]: Card(id=item["cardId"], title=item["card"]["title"])
+        for item in resp.json().get("cards", [])
+    }
 
-    if name_or_id in manager.library:
-        return manager.library[name_or_id]
+    if name_or_id in library:
+        return library[name_or_id]
 
     query = name_or_id.lower()
-    matches = [c for c in manager.library.values() if query in c.title.lower()]
+    matches = [c for c in library.values() if query in c.title.lower()]
 
     if not matches:
-        available = "\n".join(f"  {c.id}: {c.title}" for c in manager.library.values())
+        available = "\n".join(f"  {c.id}: {c.title}" for c in library.values())
         sys.exit(f"No card matching '{name_or_id}'.\n\nAvailable cards:\n{available}")
 
     if len(matches) > 1:
@@ -223,7 +293,6 @@ def download_mp3(youtube_url: str, output_dir: Path) -> tuple[Path, str, int]:
 # Yoto media upload
 # ---------------------------------------------------------------------------
 
-
 def upload_and_transcode(mp3_path: Path, manager: YotoManager, token_file: Path) -> dict:
     """
     Upload an MP3 to Yoto's media store and wait for transcoding.
@@ -258,7 +327,6 @@ def upload_and_transcode(mp3_path: Path, manager: YotoManager, token_file: Path)
     # Step 3: poll for transcoding with exponential backoff (max ~5 min total)
     delay = 1.0
     elapsed = 0.0
-    attempt = 0
     while elapsed < 300:
         time.sleep(delay)
         elapsed += delay
@@ -267,7 +335,6 @@ def upload_and_transcode(mp3_path: Path, manager: YotoManager, token_file: Path)
             params={"loudnorm": "false"},
             headers=_auth_headers(manager, token_file),
         )
-        attempt += 1
         if poll_resp.status_code == 202:
             delay = min(delay * 1.5, 15.0)
             continue
@@ -293,7 +360,7 @@ def upload_and_transcode(mp3_path: Path, manager: YotoManager, token_file: Path)
 # ---------------------------------------------------------------------------
 
 def add_track_to_card(
-    card,
+    card: Card,
     transcode: dict,
     track_title: str,
     manager: YotoManager,
@@ -422,7 +489,7 @@ def main() -> None:
     manager = YotoManager(client_id=client_id)
     authenticate(manager, token_file)
 
-    card = find_card(manager, args.playlist)
+    card = find_card(manager, token_file, args.playlist)
     print(f"Target card: {card.title} ({card.id})")
 
     # Download into a temp dir (cleaned up automatically) unless --output-dir is set
@@ -435,7 +502,7 @@ def main() -> None:
             _run(args, card, manager, token_file, Path(tmp), keep_mp3=False)
 
 
-def _run(args, card, manager, token_file, output_dir: Path, keep_mp3: bool) -> None:
+def _run(args, card: Card, manager: YotoManager, token_file: Path, output_dir: Path, keep_mp3: bool) -> None:
     print(f"Downloading audio from YouTube...")
     mp3_path, title, duration = download_mp3(args.youtube_url, output_dir)
     print(f"Downloaded: {title} ({duration}s)")

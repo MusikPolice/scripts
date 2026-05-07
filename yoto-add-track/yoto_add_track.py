@@ -23,7 +23,6 @@ See README.md for full setup instructions.
 """
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -42,6 +41,7 @@ YOTO_API_BASE = "https://api.yotoplay.com"
 YOTO_AUTH_URL = "https://login.yotoplay.com/oauth/device/code"
 YOTO_TOKEN_URL = "https://login.yotoplay.com/oauth/token"
 YOTO_SCOPES = "family:library:view user:content:manage offline_access"
+
 
 
 # ---------------------------------------------------------------------------
@@ -223,26 +223,21 @@ def download_mp3(youtube_url: str, output_dir: Path) -> tuple[Path, str, int]:
 # Yoto media upload
 # ---------------------------------------------------------------------------
 
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
 
 def upload_and_transcode(mp3_path: Path, manager: YotoManager, token_file: Path) -> dict:
     """
     Upload an MP3 to Yoto's media store and wait for transcoding.
     Returns the transcode result dict (transcodedSha256, duration, fileSize, channels, format).
     """
-    file_hash = sha256_file(mp3_path)
-
-    # Step 1: get a signed upload URL
+    # Step 1: get a signed upload URL.
+    # We intentionally omit the sha256 deduplication hint so Yoto always
+    # issues a fresh base64url job ID. When sha256 is passed and the file
+    # already exists, Yoto returns the raw hex hash as uploadId and routes
+    # the poll through different AWS infrastructure that rejects Bearer tokens.
     headers = _auth_headers(manager, token_file)
     resp = requests.get(
         f"{YOTO_API_BASE}/media/transcode/audio/uploadUrl",
-        params={"sha256": file_hash, "filename": mp3_path.name},
+        params={"filename": mp3_path.name},
         headers=headers,
     )
     resp.raise_for_status()
@@ -250,30 +245,47 @@ def upload_and_transcode(mp3_path: Path, manager: YotoManager, token_file: Path)
     upload_id = upload_data["uploadId"]
     upload_url = upload_data.get("uploadUrl")
 
-    # Step 2: upload if not already on the CDN
-    if upload_url:
-        print(f"Uploading {mp3_path.name} ({mp3_path.stat().st_size // 1024} KB)...")
-        with open(mp3_path, "rb") as f:
-            put_resp = requests.put(upload_url, data=f, headers={"Content-Type": "audio/mpeg"})
-            put_resp.raise_for_status()
-        print("Upload complete. Waiting for Yoto to transcode...")
-    else:
-        print("File already exists on Yoto CDN, skipping upload.")
+    if not upload_url:
+        sys.exit("Yoto did not provide an upload URL. Try again.")
 
-    # Step 3: poll for transcoding (up to 30 s)
-    for attempt in range(60):
-        time.sleep(0.5)
+    # Step 2: upload to the signed S3 URL
+    print(f"Uploading {mp3_path.name} ({mp3_path.stat().st_size // 1024} KB)...")
+    with open(mp3_path, "rb") as f:
+        put_resp = requests.put(upload_url, data=f, headers={"Content-Type": "audio/mpeg"})
+        put_resp.raise_for_status()
+    print("Upload complete. Waiting for Yoto to transcode...")
+
+    # Step 3: poll for transcoding with exponential backoff (max ~5 min total)
+    delay = 1.0
+    elapsed = 0.0
+    attempt = 0
+    while elapsed < 300:
+        time.sleep(delay)
+        elapsed += delay
         poll_resp = requests.get(
-            f"{YOTO_API_BASE}/media/transcode/audio/{upload_id}",
+            f"{YOTO_API_BASE}/media/upload/{upload_id}/transcoded",
+            params={"loudnorm": "false"},
             headers=_auth_headers(manager, token_file),
         )
+        attempt += 1
+        if poll_resp.status_code == 202:
+            delay = min(delay * 1.5, 15.0)
+            continue
         poll_resp.raise_for_status()
-        result = poll_resp.json()
-        if result.get("transcodedSha256"):
+        transcode_data = poll_resp.json().get("transcode", {})
+        if transcode_data.get("transcodedSha256"):
             print("Transcoding complete.")
-            return result
+            info = transcode_data.get("transcodedInfo", {})
+            return {
+                "transcodedSha256": transcode_data["transcodedSha256"],
+                "duration": info.get("duration", 0),
+                "format": info.get("format", "opus"),
+                "channels": info.get("channels", "stereo"),
+                "fileSize": info.get("fileSize", 0),
+            }
+        delay = min(delay * 1.5, 15.0)
 
-    sys.exit("Timed out waiting for Yoto to finish transcoding (30 s). Try again in a moment.")
+    sys.exit("Timed out waiting for Yoto to finish transcoding (5 min). Try again in a moment.")
 
 
 # ---------------------------------------------------------------------------
@@ -287,57 +299,89 @@ def add_track_to_card(
     manager: YotoManager,
     token_file: Path,
 ) -> None:
-    """Fetch the card's current content and append the new track to chapter 1."""
-    headers = _auth_headers(manager, token_file)
+    """
+    Fetch the card's current content and add the new track as a new chapter.
+
+    The card structure used by the Yoto web interface is one chapter per song,
+    each containing a single track. We match that structure here.
+    """
+    track_url = f"yoto:#{transcode['transcodedSha256']}"
 
     # Read current card content
     resp = requests.get(
         f"{YOTO_API_BASE}/content/{card.id}",
         params={"timezone": "UTC"},
-        headers=headers,
+        headers=_auth_headers(manager, token_file),
     )
     resp.raise_for_status()
-    card_data = resp.json()
-
-    content = card_data.get("content", {})
+    card_info = resp.json()["card"]
+    content = card_info.get("content", {})
     chapters = content.get("chapters", [])
 
-    if not chapters:
-        chapters = [{"key": "1", "title": card_data.get("title", "Playlist"), "tracks": []}]
+    # Guard: skip if this track is already present anywhere on the card
+    for chapter in chapters:
+        for track in chapter.get("tracks", []):
+            if track.get("trackUrl") == track_url:
+                print(f"'{track_title}' is already on this card — skipping.")
+                return
 
-    chapter = chapters[0]
-    tracks = chapter.get("tracks", [])
+    # Determine the next chapter key (zero-padded decimal, matching existing convention)
+    # and the next overlay label (1-indexed position number shown on the card)
+    key_nums = [int(c["key"]) for c in chapters if str(c.get("key", "")).isdigit()]
+    new_chapter_key = str(max(key_nums, default=-1) + 1).zfill(2)
 
-    # Use a 1-based integer string key, incrementing past the highest existing key
-    existing_keys = [int(t["key"]) for t in tracks if str(t.get("key", "")).isdigit()]
-    new_key = str(max(existing_keys, default=0) + 1)
+    label_nums = [int(c["overlayLabel"]) for c in chapters
+                  if str(c.get("overlayLabel", "")).isdigit()]
+    new_overlay_label = str(max(label_nums, default=0) + 1)
 
-    tracks.append({
-        "key": new_key,
+    new_chapter = {
+        "key": new_chapter_key,
         "title": track_title,
-        "trackUrl": f"yoto:#{transcode['transcodedSha256']}",
-        "type": "audio",
-        "format": transcode.get("format", "mp3"),
+        "overlayLabel": new_overlay_label,
         "duration": transcode.get("duration", 0),
-        "channels": transcode.get("channels", 2),
-    })
-    chapter["tracks"] = tracks
-    chapters[0] = chapter
+        "fileSize": transcode.get("fileSize", 0),
+        "tracks": [{
+            "key": "01",
+            "title": track_title,
+            "overlayLabel": new_overlay_label,
+            "trackUrl": track_url,
+            "type": "audio",
+            "format": transcode.get("format", "opus"),
+            "duration": transcode.get("duration", 0),
+            "fileSize": transcode.get("fileSize", 0),
+            "channels": transcode.get("channels", "stereo"),
+        }],
+    }
+    chapters.append(new_chapter)
     content["chapters"] = chapters
 
     payload = {
         "cardId": card.id,
-        "title": card_data.get("title", ""),
+        "title": card_info.get("title", ""),
         "content": content,
     }
-
     write_resp = requests.post(
         f"{YOTO_API_BASE}/content",
         json=payload,
         headers=_auth_headers(manager, token_file),
     )
     write_resp.raise_for_status()
-    print(f"Added '{track_title}' to '{card_data.get('title', card.id)}' (track {new_key}).")
+
+    # Verify the track is visible in a fresh fetch
+    verify_resp = requests.get(
+        f"{YOTO_API_BASE}/content/{card.id}",
+        params={"timezone": "UTC"},
+        headers=_auth_headers(manager, token_file),
+    )
+    verify_resp.raise_for_status()
+    verify_chapters = verify_resp.json()["card"].get("content", {}).get("chapters", [])
+    for chapter in verify_chapters:
+        for track in chapter.get("tracks", []):
+            if track.get("trackUrl") == track_url:
+                print(f"Added '{track_title}' to '{card_info.get('title', card.id)}' "
+                      f"(position {chapter.get('overlayLabel', '?')}).")
+                return
+    print(f"Warning: could not verify '{track_title}' was added — check the Yoto web interface.")
 
 
 # ---------------------------------------------------------------------------

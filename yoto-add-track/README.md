@@ -98,9 +98,10 @@ uv run yoto_add_track.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ" "aB3xY"
 ### What happens
 
 1. YouTube URL is resolved and audio downloaded as MP3 via `yt-dlp`
-2. The MP3 is uploaded to Yoto's media store (deduplicated by SHA-256 — re-uploading the same file is a no-op)
-3. Yoto transcodes the file server-side; the script polls until transcoding completes
-4. The existing playlist is fetched, the new track appended, and the full content object written back
+2. The MP3 is uploaded to Yoto's media store via a pre-signed S3 URL
+3. Yoto transcodes the file server-side (to Opus); the script polls with exponential backoff until transcoding completes
+4. The existing card is fetched, a new chapter containing the new track is appended, and the updated card is written back
+5. The card is re-fetched to verify the track landed correctly
 
 ### CLI flags
 
@@ -123,25 +124,26 @@ YouTube URL
 yt-dlp + ffmpeg                   → temp .mp3 file
     │
     ▼
-SHA-256 hash of .mp3
+GET /media/transcode/audio/uploadUrl?filename=<name>
+    │  returns: uploadId (base64url) + signed S3 URL
+    ▼
+PUT <signedS3Url>                  → upload MP3
     │
     ▼
-GET /media/transcode/audio/uploadUrl?sha256=<hash>
-    │  returns: uploadId + signed S3 URL (null if file already on Yoto CDN)
-    ▼
-PUT <signedS3Url>                  → upload MP3 (skipped if already exists)
-    │
-    ▼
-GET /media/transcode/audio/<uploadId>   (poll every 500ms, max 30 attempts)
-    │  returns: transcodedSha256, duration, fileSize, channels, format
+GET /media/upload/<uploadId>/transcoded   (exponential backoff, max 5 min)
+    │  202 = in progress; 200 = done
+    │  returns: { transcode: { transcodedSha256, transcodedInfo: { duration, fileSize, channels, format } } }
     ▼
 GET /content/<cardId>              → fetch existing card (chapters + tracks)
     │
     ▼
-Append new track to chapter list
+Append new chapter (one chapter per song) to chapters list
     │
     ▼
 POST /content                      → write updated card back to Yoto
+    │
+    ▼
+GET /content/<cardId>              → verify track is present
 ```
 
 ### Authentication
@@ -151,32 +153,38 @@ Uses **OAuth 2.0 Device Authorization Flow** — suitable for CLI/headless use.
 - Auth server: `https://login.yotoplay.com`
 - Device code endpoint: `POST /oauth/device/code`
 - Token endpoint: `POST /oauth/token`
-- Required scope: `user:content:manage`
+- Required scopes: `family:library:view user:content:manage offline_access`
 - Access tokens are short-lived JWTs; refresh tokens are single-use and automatically rotated
 
-The `yoto-api` Python library (`cdnninja/yoto_api`) handles the auth flow and token refresh. Media upload and content creation are called directly against the REST API since the library does not wrap those endpoints.
+The `yoto-api` Python library (`cdnninja/yoto_api`) is used for token refresh and library listing. The script implements its own device code flow rather than using the library's `device_code_flow_start()` method, because the library hardcodes `scope: "offline_access"` in its auth request — which produces a token that cannot access content or library endpoints. Media upload and content creation are called directly against the REST API since the library does not wrap those endpoints.
 
 ### Data model
 
-A Yoto **card** contains one or more **chapters**, each of which contains one or more **tracks**. For a flat music playlist, all tracks live in a single chapter.
+A Yoto **card** contains one or more **chapters**, each of which contains one or more **tracks**. The Yoto web interface uses one chapter per song, each containing a single track. This script matches that structure.
+
+Chapter keys are zero-padded decimal strings (`"00"`, `"01"`, …). The `overlayLabel` is the 1-indexed position number displayed on the physical card (`"1"`, `"2"`, …).
 
 ```
 Card
-├── cardId        (5-char alphanumeric, e.g. "aB3xY")
+├── cardId           (5-char alphanumeric, e.g. "aB3xY")
 ├── title
 └── content
-    └── chapters[]
-        ├── key   (unique within card)
+    └── chapters[]   (one chapter per song)
+        ├── key          (zero-padded decimal: "00", "01", …)
         ├── title
-        └── tracks[]
-            ├── key
+        ├── overlayLabel (1-indexed position: "1", "2", …)
+        ├── duration     (seconds)
+        ├── fileSize     (bytes)
+        └── tracks[]     (one track per chapter)
+            ├── key          → "01"
             ├── title
-            ├── trackUrl  → "yoto:#<transcodedSha256>"
-            ├── type      → "audio"
-            ├── format    → "mp3"
-            ├── duration  (seconds)
-            ├── fileSize  (bytes)
-            └── channels  (1 or 2)
+            ├── overlayLabel (matches chapter overlayLabel)
+            ├── trackUrl     → "yoto:#<transcodedSha256>"
+            ├── type         → "audio"
+            ├── format       → "opus"
+            ├── duration     (seconds)
+            ├── fileSize     (bytes)
+            └── channels     → "stereo" or "mono"
 ```
 
 ### API base URL
@@ -196,32 +204,57 @@ All requests use `Authorization: Bearer <access_token>`.
 | `GET` | `/content` | List all cards in library |
 | `GET` | `/content/<cardId>` | Fetch full card (chapters + tracks) |
 | `POST` | `/content` | Create or update a card |
-| `GET` | `/media/transcode/audio/uploadUrl?sha256=<hash>` | Get signed S3 upload URL |
+| `GET` | `/media/transcode/audio/uploadUrl?filename=<name>` | Get signed S3 upload URL + uploadId |
 | `PUT` | `<signedS3Url>` | Upload MP3 to S3 |
-| `GET` | `/media/transcode/audio/<uploadId>` | Poll for transcode completion |
+| `GET` | `/media/upload/<uploadId>/transcoded` | Poll for transcode completion (202 = pending, 200 = done) |
 
 ### POST /content payload (update existing card)
+
+One chapter per song. The full chapters array (existing + new) is sent each time.
 
 ```json
 {
   "cardId": "aB3xY",
   "title": "Kids Party Mix",
   "content": {
-    "playbackType": "linear",
     "chapters": [
       {
-        "key": "1",
-        "title": "Kids Party Mix",
+        "key": "00",
+        "title": "Song One",
+        "overlayLabel": "1",
+        "duration": 200,
+        "fileSize": 3200000,
         "tracks": [
           {
-            "key": "1",
-            "title": "Never Gonna Give You Up",
+            "key": "01",
+            "title": "Song One",
+            "overlayLabel": "1",
             "trackUrl": "yoto:#<transcodedSha256>",
             "type": "audio",
-            "format": "mp3",
+            "format": "opus",
+            "duration": 200,
+            "fileSize": 3200000,
+            "channels": "stereo"
+          }
+        ]
+      },
+      {
+        "key": "01",
+        "title": "Never Gonna Give You Up",
+        "overlayLabel": "2",
+        "duration": 213,
+        "fileSize": 3410000,
+        "tracks": [
+          {
+            "key": "01",
+            "title": "Never Gonna Give You Up",
+            "overlayLabel": "2",
+            "trackUrl": "yoto:#<transcodedSha256>",
+            "type": "audio",
+            "format": "opus",
             "duration": 213,
-            "fileSize": 8520000,
-            "channels": 2
+            "fileSize": 3410000,
+            "channels": "stereo"
           }
         ]
       }
@@ -267,13 +300,15 @@ Declared inline in `yoto_add_track.py` via [PEP 723](https://peps.python.org/pep
 
 ## Implementation status
 
-- [x] `yoto_add_track.py` — written, not yet tested against live API
+- [x] `yoto_add_track.py` — written and tested against live API
 - [x] `.env.example`
 - [x] `.gitignore`
 
-### What still needs testing
+### Notes from live testing
 
-- **First-run auth flow**: `device_code_flow_start()` return shape not verified against live API — the script reads `verification_uri_complete`, `verification_uri`, and `user_code` defensively, but may need adjusting once we see the actual response.
-- **`set_refresh_token` behaviour**: Not confirmed whether calling it triggers an immediate token exchange or just stores the value. The script calls `check_and_refresh_token()` immediately after to be safe.
-- **`GET /content/<cardId>` response shape**: The script expects `content.chapters` to be an array of objects with a `tracks` array. If the live API returns a different structure, `add_track_to_card()` will need to be updated.
-- **Track key convention**: The script uses 1-based integer strings (`"1"`, `"2"`, …), incrementing past the highest existing numeric key. This matches the Yoto API docs examples but hasn't been verified against a real card.
+- **Auth flow**: `verification_uri_complete` is returned by the Yoto device code endpoint and includes the user code embedded in the URL. The script uses it directly if present, falling back to `verification_uri` + separate `user_code` display.
+- **`set_refresh_token` behaviour**: Sets `manager.token` to a `Token` with only the refresh_token field populated (access_token is None). `check_and_refresh_token()` detects the missing access token and calls `api.refresh_token()` to exchange it.
+- **Upload URL endpoint**: Pass `filename=<name>` (not `sha256=<hash>`). When sha256 is passed and the file already exists on the CDN, Yoto returns the raw hex hash as the uploadId, which routes through different AWS infrastructure that rejects Bearer tokens on the poll endpoint.
+- **Poll endpoint**: `GET /media/upload/<uploadId>/transcoded` (not `/media/transcode/audio/<uploadId>`). Returns 202 while transcoding, 200 when complete. Transcoded metadata is at `response["transcode"]["transcodedInfo"]`.
+- **Card structure**: One chapter per song, each chapter has exactly one track. Chapter keys are zero-padded decimals (`"00"`, `"01"`, …); `overlayLabel` is the 1-indexed human-visible position number.
+- **`channels` field**: Must be the string `"stereo"` or `"mono"`, not an integer.

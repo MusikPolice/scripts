@@ -10,5 +10,8 @@ Permanently deletes old emails from Gmail using the Gmail API. Targets read inbo
 ### [remove-empty-folders](remove-empty-folders/README.md)
 A PowerShell script that recursively scans a directory and deletes any empty folders found within. Supports a `-WhatIf` dry-run flag.
 
+### [youtube-to-mp3](youtube-to-mp3/README.md)
+Downloads audio from a YouTube video, normalizes to 0 dB true peak, trims silence, and saves as a titled MP3. Optionally creates a pitch-shifted copy transposed by a given number of semitones.
+
 ### [yoto-add-track](yoto-add-track/README.md)
 Downloads a song from YouTube and adds it to an existing playlist on a Yoto MYO card. Takes a YouTube URL and playlist name/ID as arguments.

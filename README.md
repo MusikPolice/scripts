@@ -15,3 +15,6 @@ Downloads audio from a YouTube video, normalizes to 0 dB true peak, trims silenc
 
 ### [yoto-add-track](yoto-add-track/README.md)
 Downloads a song from YouTube and adds it to an existing playlist on a Yoto MYO card. Takes a YouTube URL and playlist name/ID as arguments.
+
+### [heic-to-jpg](heic-to-jpg/README.md)
+Recursively converts HEIC photos (shot on iPhone) to JPG using ImageMagick. Deletes each original HEIC after a confirmed successful conversion. Supports `-WhatIf` dry-run mode.

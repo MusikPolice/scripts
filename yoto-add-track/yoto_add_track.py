@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "yt-dlp>=2024.1.0",
+#   "yt-dlp>=2026.8.19",
 #   "requests>=2.31.0",
 #   "python-dotenv>=1.0.0",
 # ]
@@ -297,8 +297,20 @@ def download_mp3(youtube_url: str, output_dir: Path) -> tuple[Path, str, int]:
         "no_warnings": True,
     }
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=True)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=True)
+    except yt_dlp.utils.DownloadError as e:
+        if "403" in str(e) or "Forbidden" in str(e):
+            sys.exit(
+                f"YouTube download failed ({e}).\n"
+                "This usually means yt-dlp is out of date and YouTube has changed "
+                "something it doesn't know how to handle yet. Try updating it:\n"
+                "  uv cache clean yt-dlp\n"
+                "and bump the yt-dlp version pin in the script's dependency block "
+                "if the issue persists (check https://pypi.org/project/yt-dlp/ for the latest)."
+            )
+        raise
 
     video_id = info.get("id", "audio")
     title = info.get("title", "Unknown")

@@ -489,14 +489,84 @@ def add_track_to_card(
 # Entry point
 # ---------------------------------------------------------------------------
 
+HELP_EPILOG = """\
+examples:
+  Add one song to the card whose title contains "bedtime":
+    uv run yoto_add_track.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ" bedtime
+
+  Add every video in a YouTube playlist to card ID abc12:
+    uv run yoto_add_track.py "https://www.youtube.com/playlist?list=PL..." abc12
+
+  Test the download without touching the card, keeping the MP3:
+    uv run yoto_add_track.py "https://youtu.be/dQw4w9WgXcQ" bedtime --dry-run --output-dir .\\mp3s
+
+notes:
+  - Order matters: the YouTube URL comes FIRST, the card name/ID SECOND.
+  - Quote URLs. In PowerShell an unquoted '&' in a URL breaks the command.
+  - Card names with spaces need quotes, e.g. "Road Trip".
+  - If the name matches no card (or several), the script lists your cards.
+"""
+
+
+class _FriendlyParser(argparse.ArgumentParser):
+    """ArgumentParser that points at --help when the arguments are wrong."""
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(
+            2,
+            f"\nerror: {message}\n\n"
+            f"Run '{self.prog} --help' for a full description and examples.\n",
+        )
+
+
+def _looks_like_url(value: str) -> bool:
+    v = value.lower()
+    return v.startswith(("http://", "https://", "www.", "youtube.com", "youtu.be", "m.youtube.com"))
+
+
+def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    url_ok = _looks_like_url(args.youtube_url)
+    if not url_ok and _looks_like_url(args.playlist):
+        parser.error(
+            "the arguments look like they're in the wrong order.\n"
+            "The YouTube URL comes first and the card name/ID second:\n"
+            f'  {parser.prog} "{args.playlist}" "{args.youtube_url}"'
+        )
+    if not url_ok:
+        parser.error(
+            f"'{args.youtube_url}' doesn't look like a YouTube URL.\n"
+            "The first argument must be a YouTube video or playlist URL "
+            "(e.g. https://www.youtube.com/watch?v=...)."
+        )
+    host = urlparse(args.youtube_url if "://" in args.youtube_url
+                    else f"https://{args.youtube_url}").netloc.lower()
+    if not (host.endswith("youtube.com") or host.endswith("youtu.be")):
+        parser.error(
+            f"'{args.youtube_url}' is not a YouTube URL (host: {host or 'unknown'})."
+        )
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Download a YouTube video or playlist and add it to a Yoto MYO card."
+    parser = _FriendlyParser(
+        prog="yoto_add_track.py",
+        description=(
+            "Download a YouTube video (or every video in a YouTube playlist) as MP3\n"
+            "and add it to the end of an existing Yoto MYO card.\n\n"
+            "usage order:  yoto_add_track.py <youtube-url> <card-name-or-id> [options]"
+        ),
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("youtube_url", help="YouTube video or playlist URL")
+    parser.add_argument(
+        "youtube_url",
+        metavar="youtube-url",
+        help="1st argument: YouTube video or playlist URL (quote it)",
+    )
     parser.add_argument(
         "playlist",
-        help="Card title (partial, case-insensitive) or card ID (5-char alphanumeric)",
+        metavar="card-name-or-id",
+        help="2nd argument: card title (partial, case-insensitive) or 5-char card ID",
     )
     parser.add_argument(
         "--dry-run",
@@ -515,7 +585,12 @@ def main() -> None:
         default=None,
         help="Keep the downloaded MP3 in DIR instead of deleting it after upload",
     )
+    if len(sys.argv) == 1:
+        parser.print_help(sys.stderr)
+        sys.exit(2)
+
     args = parser.parse_args()
+    _validate_args(parser, args)
 
     client_id = load_config()
     token_file = Path(args.token) if args.token else Path(__file__).parent / "token.json"
